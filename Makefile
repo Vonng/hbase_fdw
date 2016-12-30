@@ -25,10 +25,10 @@ show :
 ls : show
 
 setup :
-	psql elysium < resource/hbase_setup.sql
+	psql elysium < resource/hbase_fdw_setup.sql
 
 test :
-	psql elysium < resource/hbase_test.sql
+	psql elysium < resource/hbase_fdw_test.sql
 
 clean :
 	rm -rf *.pyc
