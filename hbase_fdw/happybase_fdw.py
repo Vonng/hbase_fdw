@@ -17,13 +17,12 @@ def pprint(obj):
 class HappyBaseFdw(ForeignDataWrapper):
     def __init__(self, fdw_options, fdw_columns):
         super(HappyBaseFdw, self).__init__(fdw_options, fdw_columns)
-        log("-- Init FDW ------------------------------")
         self.fdw_columns = fdw_columns
         self.fdw_options = fdw_options
 
         self.mode = fdw_options.get('mode', 'dev')
         self.host = fdw_options.get('host')
-        self.debug = fdw_options.get('debug', None)
+        self.debug = fdw_options.get('debug', None) == 'True'
         self.table_name = fdw_options.get('table')
         self.prefix = fdw_options.get('prefix')
 
@@ -31,14 +30,24 @@ class HappyBaseFdw(ForeignDataWrapper):
             raise ValueError('host and table should be specified!')
 
         self.qualifier = {}
+        self.serializer = {}
         for col_name, col_def in fdw_columns.iteritems():
+            if col_name == 'rowkey': continue
             qualifier = col_def.options.get('qualifier')
-            if not qualifier:
-                if self.prefix:
-                    qualifier = self.prefix + col_name.split('_', 1)[-1]
+
+            # Column family already specified
+            if self.prefix:
+                if qualifier:
+                    qualifier = self.prefix + ':' + qualifier
                 else:
+                    qualifier = self.prefix + ':' + col_name
+            else:
+                if not qualifier:
                     qualifier = col_name.replace('_', ':', 1)
+
             self.qualifier[col_name] = qualifier
+            serializer = col_def.options.get('serializer')
+            self.serializer[col_name] = serializer
 
         if self.debug:
             log("-- Columns ------------------------------")
@@ -51,10 +60,37 @@ class HappyBaseFdw(ForeignDataWrapper):
         self.conn = happybase.Connection(self.host)
         self.table = self.conn.table(self.table_name)
 
-    def execute(self, quals, columns, sortkeys=None):
-        log("-- Exec begin ------------------------------")
+    def transform(self, rowkey, response):
+        '''Transform hbase result into postgres format'''
+        buf = {"rowkey": rowkey}
+        if response:
+            for col_name, qualifier in self.qualifier.iteritems():
+                value = response.get(qualifier)
+                buf[col_name] = value
+        return buf
 
+    def execute(self, quals, columns, sortkeys=None):
+        '''Query hbase: Invoked by executor
+            Usage:
+
+        -- Single selection
+        SELECT * FROM hbtest WHERE rowkey = '9c9e_2016-02-02_56444370e7e12af0561e221c';
+
+        -- Multiple selection
+        SELECT * FROM hbtest WHERE rowkey IN (
+          '9c9e_2016-02-02_56444370e7e12af0561e221c',
+          'd58c_2015-12-03_548935a4fd98c5d3510008bc',
+          'b50d_2015-12-03_5506905ffd98c5ae1b0000de',
+          'e18d_2015-12-03_559e9b1067e58e2cdd002509',
+          '8545_2015-12-03_563b1f8f67e58e55580014d1',
+          '1516_2015-12-03_56430770cc3e5975ca000012');
+
+        -- Range Scan
+        SELECT rowkey,active,install,launch FROM hbtest
+        WHERE rowkey BETWEEN '9c9a' AND '9c9f' AND active > 0 and rowkey ~ '^.{4}_.{10}_\w{24}';
+        '''
         if self.debug:
+            log("-- Exec begin ------------------------------")
             log("-- Cols & Quals ------------------------------")
             log(columns)
             log(quals)
@@ -63,22 +99,37 @@ class HappyBaseFdw(ForeignDataWrapper):
 
         # Build rowkey: type of rowkey could be str, list, dict
         rowkey = None
+
+        filter_str = None
         for qual in quals:
             if qual.field_name == 'rowkey':
+
+                # single rowkey
                 if qual.operator == '=':
                     rowkey = qual.value
+
+                # multiple rowkey
                 elif qual.is_list_operator:
                     rowkey = qual.value
+
+                # range low bound
                 elif qual.operator == '<=':
                     if isinstance(rowkey, dict):
                         rowkey['until'] = qual.value.encode('utf-8')
                     else:
                         rowkey = {'until': qual.value.encode('utf-8')}
+
+                # range high bound
                 elif qual.operator == '>=':
                     if isinstance(rowkey, dict):
                         rowkey['since'] = qual.value
-                    else:
+                    else:c
                         rowkey = {'since': qual.value}
+                # Regex like
+                elif qual.operator == '~':
+                    filter_str = "RowFilter(%s, 'regexstring:%s')" % ('=', qual.value)
+                elif qual.operator == '!~':
+                    filter_str = "RowFilter(%s, 'regexstring:%s')" % ('!=', qual.value)
                 else:
                     log(qual)
                     raise ValueError("Supported operators on rowkey : =,<=,>=,in,any,between")
@@ -86,35 +137,19 @@ class HappyBaseFdw(ForeignDataWrapper):
         # Build columns
         qualifiers = [self.qualifier[k] for k in columns if k != 'rowkey']
 
-        log(qualifiers)
+        # single rowkey
+        if isinstance(rowkey, basestring):
+            yield self.transform(rowkey, self.table.row(rowkey, qualifiers))
 
-        if isinstance(rowkey, basestring):  # Single rowkey
-            response = self.table.row(rowkey, qualifiers)
-            if not response:
-                yield {"rowkey": rowkey}
-            else:
-                buf = {col_name: response.get(qualifier) for col_name, qualifier in self.qualifier.iteritems()}
-                buf["rowkey"] = rowkey
-                yield buf
+        # multiple rowkey
+        elif isinstance(rowkey, list):
+            for rk, response in self.table.rows(rowkey, qualifiers):
+                yield self.transform(rk, response)
 
-
-        elif isinstance(rowkey, list):  # multiple rowkey
-            responses = self.table.rows(rowkey, qualifiers)
-            log(responses)
-            if not responses:
-                for rk in rowkey:
-                    yield {"rowkey": rk}
-            else:
-                for rk, response in responses:
-                    buf = {col_name: response.get(qualifier) for col_name, qualifier in self.qualifier.iteritems()}
-                    buf["rowkey"] = rk
-                    yield buf
-
-        elif isinstance(rowkey, dict):  # Range rowkey
-            for rk, response in self.table.scan(rowkey.get('since'), rowkey.get('until'), columns=qualifiers):
-                buf = {col_name: response.get(qualifier) for col_name, qualifier in self.qualifier.iteritems()}
-                buf["rowkey"] = rk
-                yield buf
-
+        # range rowkey
+        elif isinstance(rowkey, dict):
+            for rk, response in self.table.scan(rowkey.get('since'), rowkey.get('until'), columns=qualifiers,
+                                                filter=filter_str):
+                yield self.transform(rk, response)
         else:
             raise ValueError('Invalid rowkey')
