@@ -30,13 +30,6 @@ class HappyBaseFdw(ForeignDataWrapper):
         if not self.table_name or not self.host:
             raise ValueError('host and table should be specified!')
 
-        if self.debug:
-            log("-- Columns ------------------------------")
-            log(fdw_options)
-            for col_name, cd in fdw_columns.iteritems():
-                log("%-12s\t[%4d :%-30s(%s:%s)] Opt:%s" % (
-                    cd.column_name, cd.type_oid, cd.type_name, cd.base_type_name, cd.typmod, cd.options))
-
         self.qualifier = {}
         for col_name, col_def in fdw_columns.iteritems():
             qualifier = col_def.options.get('qualifier')
@@ -46,6 +39,14 @@ class HappyBaseFdw(ForeignDataWrapper):
                 else:
                     qualifier = col_name.replace('_', ':', 1)
             self.qualifier[col_name] = qualifier
+
+        if self.debug:
+            log("-- Columns ------------------------------")
+            log(fdw_options)
+            for col_name, cd in fdw_columns.iteritems():
+                log("%-12s\t[%4d :%-30s(%s:%s)] Opt:%s" % (
+                    cd.column_name, cd.type_oid, cd.type_name, cd.base_type_name, cd.typmod, cd.options))
+            log(self.qualifier)
 
         self.conn = happybase.Connection(self.host)
         self.table = self.conn.table(self.table_name)
@@ -60,9 +61,8 @@ class HappyBaseFdw(ForeignDataWrapper):
             for qual in quals:
                 log("%s %s %s" % (qual.field_name, qual.operator, qual.value))
 
+        # Build rowkey: type of rowkey could be str, list, dict
         rowkey = None
-
-        # Rowkey's type could be str, list, dict
         for qual in quals:
             if qual.field_name == 'rowkey':
                 if qual.operator == '=':
@@ -71,9 +71,9 @@ class HappyBaseFdw(ForeignDataWrapper):
                     rowkey = qual.value
                 elif qual.operator == '<=':
                     if isinstance(rowkey, dict):
-                        rowkey['until'] = qual.value
+                        rowkey['until'] = qual.value.encode('utf-8')
                     else:
-                        rowkey = {'until': qual.value}
+                        rowkey = {'until': qual.value.encode('utf-8')}
                 elif qual.operator == '>=':
                     if isinstance(rowkey, dict):
                         rowkey['since'] = qual.value
@@ -83,15 +83,38 @@ class HappyBaseFdw(ForeignDataWrapper):
                     log(qual)
                     raise ValueError("Supported operators on rowkey : =,<=,>=,in,any,between")
 
+        # Build columns
+        qualifiers = [self.qualifier[k] for k in columns if k != 'rowkey']
+
+        log(qualifiers)
+
         if isinstance(rowkey, basestring):  # Single rowkey
-            yield {"rowkey": rowkey}
+            response = self.table.row(rowkey, qualifiers)
+            if not response:
+                yield {"rowkey": rowkey}
+            else:
+                buf = {col_name: response.get(qualifier) for col_name, qualifier in self.qualifier.iteritems()}
+                buf["rowkey"] = rowkey
+                yield buf
+
+
         elif isinstance(rowkey, list):  # multiple rowkey
-            for rk in rowkey:
-                yield {"rowkey": rk}
+            responses = self.table.rows(rowkey, qualifiers)
+            log(responses)
+            if not responses:
+                for rk in rowkey:
+                    yield {"rowkey": rk}
+            else:
+                for rk, response in responses:
+                    buf = {col_name: response.get(qualifier) for col_name, qualifier in self.qualifier.iteritems()}
+                    buf["rowkey"] = rk
+                    yield buf
 
         elif isinstance(rowkey, dict):  # Range rowkey
-            for k, v in rowkey.iteritems():
-                yield {"rowkey": v}
+            for rk, response in self.table.scan(rowkey.get('since'), rowkey.get('until'), columns=qualifiers):
+                buf = {col_name: response.get(qualifier) for col_name, qualifier in self.qualifier.iteritems()}
+                buf["rowkey"] = rk
+                yield buf
 
         else:
             raise ValueError('Invalid rowkey')
