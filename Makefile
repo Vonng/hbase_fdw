@@ -25,7 +25,7 @@ show :
 ls : show
 
 setup :
-	psql elysium < resource/hbase_fdw_setup.sql
+	psql elysium < resource/hbase_fdw_setup.sql --echo-all
 
 test :
 	psql elysium < resource/hbase_fdw_test.sql

@@ -3,15 +3,9 @@
 __author__ = 'Vonng (fengruohang@outlook.com)'
 
 import json
-import requests
 import happybase
 from multicorn import ForeignDataWrapper
 from multicorn.utils import log_to_postgres as log
-from multicorn import ColumnDefinition, Qual
-
-
-def pprint(obj):
-    log(json.dumps(obj, indent=4))
 
 
 class HappyBaseFdw(ForeignDataWrapper):
@@ -57,11 +51,48 @@ class HappyBaseFdw(ForeignDataWrapper):
                     cd.column_name, cd.type_oid, cd.type_name, cd.base_type_name, cd.typmod, cd.options))
             log(self.qualifier)
 
+        self.conn = None
+        self.table = None
+
         self.conn = happybase.Connection(self.host)
         self.table = self.conn.table(self.table_name)
 
-    def transform(self, rowkey, response):
-        '''Transform hbase result into postgres format'''
+    def get_rel_size(self, quals, columns):
+        """
+        Estimate result size by conditions
+        """
+        for qual in quals:
+            if qual.field_name == 'rowkey':
+                # single rowkey
+                if qual.operator == '=':
+                    return (1, len(columns) * 100)
+
+                # multiple rowkey
+                elif qual.is_list_operator:
+                    return (len(qual.value), len(columns) * 100)
+
+                # range scan
+                elif qual.operator == '<=' or qual.operator == '>=':
+                    return (100000, len(columns) * 100)
+
+        # Full table scan
+        return (100000000, len(columns) * 100)
+
+    @property
+    def rowid_column(self):
+        return 'rowkey'
+
+    def wrap(self, payload):
+        buf = {}
+        if payload:
+            for col_name, value in payload.iteritems():
+                if col_name == 'rowkey': continue
+                qualifier = self.qualifier.get(col_name)
+                buf[qualifier] = str(value)
+        return buf
+
+    def unwrap(self, rowkey, response):
+        '''unwrap hbase result into postgres format'''
         buf = {"rowkey": rowkey}
         if response:
             for col_name, qualifier in self.qualifier.iteritems():
@@ -123,7 +154,7 @@ class HappyBaseFdw(ForeignDataWrapper):
                 elif qual.operator == '>=':
                     if isinstance(rowkey, dict):
                         rowkey['since'] = qual.value
-                    else:c
+                    else:
                         rowkey = {'since': qual.value}
                 # Regex like
                 elif qual.operator == '~':
@@ -137,19 +168,33 @@ class HappyBaseFdw(ForeignDataWrapper):
         # Build columns
         qualifiers = [self.qualifier[k] for k in columns if k != 'rowkey']
 
+        # full table scan
+        if not rowkey:
+            for rk, response in self.table.scan(columns=qualifiers, filter=filter_str):
+                yield self.unwrap(rk, response)
+
         # single rowkey
-        if isinstance(rowkey, basestring):
-            yield self.transform(rowkey, self.table.row(rowkey, qualifiers))
+        elif isinstance(rowkey, basestring):
+            yield self.unwrap(rowkey, self.table.row(rowkey, qualifiers))
 
         # multiple rowkey
         elif isinstance(rowkey, list):
             for rk, response in self.table.rows(rowkey, qualifiers):
-                yield self.transform(rk, response)
+                yield self.unwrap(rk, response)
 
         # range rowkey
         elif isinstance(rowkey, dict):
             for rk, response in self.table.scan(rowkey.get('since'), rowkey.get('until'), columns=qualifiers,
                                                 filter=filter_str):
-                yield self.transform(rk, response)
+                yield self.unwrap(rk, response)
         else:
             raise ValueError('Invalid rowkey')
+
+    def insert(self, values):
+        rowkey = values.get('rowkey')
+        if not rowkey: return {}
+
+        self.table.put(rowkey, self.wrap(values))
+
+    def delete(self, rowkey):
+        self.table.delete(rowkey)

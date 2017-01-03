@@ -18,7 +18,9 @@ CREATE FOREIGN TABLE IF NOT EXISTS hbtest (
 );
 
 -- Single selection
-SELECT * FROM hbtest WHERE rowkey = '9c9e_2016-02-02_56444370e7e12af0561e221c';
+SELECT *
+FROM hbtest
+WHERE rowkey = '9c9e_2016-02-02_56444370e7e12af0561e221c';
 
 -- Multiple selection
 SELECT * FROM hbtest WHERE rowkey IN (
@@ -31,4 +33,17 @@ SELECT * FROM hbtest WHERE rowkey IN (
 
 -- Range Scan
 SELECT rowkey,active,install,launch FROM hbtest
-WHERE rowkey BETWEEN '9c9a' AND '9c9c' AND active > 0 and install > 0 and rowkey ~ '^.{4}_.{10}_\w{24}';
+WHERE rowkey BETWEEN '9c9a' AND '9c9c' AND active > 0 and install > 0 and rowkey ~ '^.{4}_.{10}_\w{24}' LIMIT 20;
+
+
+
+SELECT * FROM hbtest where rowkey in ('hbtest1','hbtest2');
+
+INSERT INTO hbtest (rowkey, active, install, launch) VALUES ('hbtest1', 1, 2, 3);
+INSERT INTO hbtest (rowkey, active, install, launch) VALUES ('hbtest2', 1, 2, 3);
+
+SELECT * FROM hbtest where rowkey in ('hbtest1','hbtest2');
+
+DELETE FROM hbtest where rowkey = 'hbtest1';
+
+SELECT * FROM hbtest where rowkey in ('hbtest1','hbtest2');
