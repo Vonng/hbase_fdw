@@ -3,9 +3,25 @@
 __author__ = 'Vonng (fengruohang@outlook.com)'
 
 import json
+import time, datetime
+from dateutil.parser import parse
 import happybase
 from multicorn import ForeignDataWrapper
 from multicorn.utils import log_to_postgres as log
+
+TS_CONVERTER = {
+    20: lambda t: int(t),  # BIGINT -> int
+    1082: lambda t: int(time.mktime(t.timetuple())) * 1000,  # DATE -> datetime.date
+    1114: lambda t: int(time.mktime(t.timetuple())) * 1000,  # TIMESTAMP -> datetime.datetime
+    1184: lambda t: int(time.mktime(parse(t).timetuple()) * 1000),  # TIMESTAMPTZ -> iso8601 unicode (WTF)
+}
+
+TS_RECONVERTER = {
+    20: lambda t: int(t),  # BIGINT -> int
+    1082: lambda t: datetime.date.fromtimestamp(t / 1000),  # DATE -> datetime.date
+    1114: lambda t: datetime.date.fromtimestamp(t / 1000),  # TIMESTAMP -> datetime.datetime
+    1184: lambda t: datetime.date.fromtimestamp(t / 1000),  # TIMESTAMPTZ -> iso8601 unicode (WTF)
+}
 
 
 class HappyBaseFdw(ForeignDataWrapper):
@@ -15,18 +31,29 @@ class HappyBaseFdw(ForeignDataWrapper):
         self.fdw_options = fdw_options
 
         self.mode = fdw_options.get('mode', 'dev')
-        self.host = fdw_options.get('host')
+        self.host = fdw_options.get('host', 'localhost')
+        self.port = int(fdw_options.get('port', '9090'))
         self.debug = fdw_options.get('debug', None) == 'True'
         self.table_name = fdw_options.get('table')
         self.prefix = fdw_options.get('prefix')
 
         if not self.table_name or not self.host:
-            raise ValueError('host and table should be specified!')
+            raise ValueError('[HB-FDW] Host and table should be specified!')
 
         self.qualifier = {}
         self.serializer = {}
+        self.include_timestamp = False
+        self.ts_converter = None
+        self.ts_reconverter = None
+
         for col_name, col_def in fdw_columns.iteritems():
             if col_name == 'rowkey': continue
+            if col_name == 'timestamp':
+                self.include_timestamp = True
+                self.ts_converter = TS_CONVERTER.get(col_def.type_oid)
+                self.ts_reconverter = TS_RECONVERTER.get(col_def.type_oid)
+                continue
+
             qualifier = col_def.options.get('qualifier')
 
             # Column family already specified
@@ -44,17 +71,20 @@ class HappyBaseFdw(ForeignDataWrapper):
             self.serializer[col_name] = serializer
 
         if self.debug:
-            log("-- Columns ------------------------------")
-            log(fdw_options)
+            log("[HB-FDW] FDW Column Define ========================")
             for col_name, cd in fdw_columns.iteritems():
-                log("%-12s\t[%4d :%-30s(%s:%s)] Opt:%s" % (
+                log("[HB-FDW] %-12s\t[%d :%-s(%s:%s)] Opt:%s" % (
                     cd.column_name, cd.type_oid, cd.type_name, cd.base_type_name, cd.typmod, cd.options))
-            log(self.qualifier)
 
-        self.conn = None
-        self.table = None
+            log("[HB-FDW] FDW Options ===============================")
+            for k, v in fdw_options.iteritems():
+                log("[HB-FDW] %s:%s" % (k, v))
 
-        self.conn = happybase.Connection(self.host)
+            log("[HB-FDW] Column Alias ==============================")
+            for k, v in self.qualifier.iteritems():
+                log("[HB-FDW] %12s\t%s" % (k, v))
+
+        self.conn = happybase.Connection(self.host, self.port)
         self.table = self.conn.table(self.table_name)
 
     def get_rel_size(self, quals, columns):
@@ -82,55 +112,42 @@ class HappyBaseFdw(ForeignDataWrapper):
     def rowid_column(self):
         return 'rowkey'
 
-    def wrap(self, payload):
-        buf = {}
-        if payload:
-            for col_name, value in payload.iteritems():
-                if col_name == 'rowkey': continue
-                qualifier = self.qualifier.get(col_name)
-                buf[qualifier] = str(value)
-        return buf
-
-    def unwrap(self, rowkey, response):
-        '''unwrap hbase result into postgres format'''
+    def wrap(self, rowkey, response):
+        '''wrap hbase result into postgres format'''
         buf = {"rowkey": rowkey}
+        max_ts = 0
         if response:
-            for col_name, qualifier in self.qualifier.iteritems():
-                value = response.get(qualifier)
-                buf[col_name] = value
+            if self.include_timestamp:
+                for col_name, qualifier in self.qualifier.iteritems():
+                    value = response.get(qualifier)
+                    if value:
+                        value, ts = value
+                        if ts > max_ts: max_ts = ts
+                    buf[col_name] = value
+                    buf["timestamp"] = self.ts_reconverter(max_ts)
+            else:
+                for col_name, qualifier in self.qualifier.iteritems():
+                    value = response.get(qualifier)
+                    if value:
+                        buf[col_name] = value
         return buf
 
     def execute(self, quals, columns, sortkeys=None):
-        '''Query hbase: Invoked by executor
-            Usage:
-
-        -- Single selection
-        SELECT * FROM hbtest WHERE rowkey = '9c9e_2016-02-02_56444370e7e12af0561e221c';
-
-        -- Multiple selection
-        SELECT * FROM hbtest WHERE rowkey IN (
-          '9c9e_2016-02-02_56444370e7e12af0561e221c',
-          'd58c_2015-12-03_548935a4fd98c5d3510008bc',
-          'b50d_2015-12-03_5506905ffd98c5ae1b0000de',
-          'e18d_2015-12-03_559e9b1067e58e2cdd002509',
-          '8545_2015-12-03_563b1f8f67e58e55580014d1',
-          '1516_2015-12-03_56430770cc3e5975ca000012');
-
-        -- Range Scan
-        SELECT rowkey,active,install,launch FROM hbtest
-        WHERE rowkey BETWEEN '9c9a' AND '9c9f' AND active > 0 and rowkey ~ '^.{4}_.{10}_\w{24}';
-        '''
+        """
+        Query hbase
+        :param quals:       list of qualification
+        :param columns:     set of required columns
+        :param sortkeys:    keys to be sored
+        :return:            data dict
+        """
         if self.debug:
-            log("-- Exec begin ------------------------------")
-            log("-- Cols & Quals ------------------------------")
-            log(columns)
-            log(quals)
-            for qual in quals:
-                log("%s %s %s" % (qual.field_name, qual.operator, qual.value))
+            log("[HB-FDW] Query Begin ================================")
+            log("[HB-FDW] Columns : %s" % columns)
+            log("[HB-FDW] Quals   : %s" % quals)
 
         # Build rowkey: type of rowkey could be str, list, dict
         rowkey = None
-
+        ts_max = None
         filter_str = None
         for qual in quals:
             if qual.field_name == 'rowkey':
@@ -138,10 +155,16 @@ class HappyBaseFdw(ForeignDataWrapper):
                 # single rowkey
                 if qual.operator == '=':
                     rowkey = qual.value
+                    if len(columns) == 1:  # rowkey only
+                        yield {"rowkey": rowkey}
+                        return
 
                 # multiple rowkey
                 elif qual.is_list_operator:
                     rowkey = qual.value
+                    if len(columns) == 1:
+                        for rk in rowkey:
+                            yield {"rowkey": rowkey}
 
                 # range low bound
                 elif qual.operator == '<=':
@@ -163,43 +186,81 @@ class HappyBaseFdw(ForeignDataWrapper):
                     filter_str = "RowFilter(%s, 'regexstring:%s')" % ('!=', qual.value)
                 else:
                     log(qual)
-                    raise ValueError("Supported operators on rowkey : =,<=,>=,in,any,between")
+                    raise ValueError("[HB-FDW] Supported operators on rowkey : =,<=,>=,in,any,between")
+
+            elif qual.field_name == 'timestamp':
+                # lots of timestamp related function is not supported by happybase
+                # Supported qual: <
+                if qual.operator == '<':
+                    timestamp = qual.value
+                    if self.ts_converter:
+                        timestamp = self.ts_converter(timestamp)
+                    ts_max = timestamp
 
         # Build columns
-        qualifiers = [self.qualifier[k] for k in columns if k != 'rowkey']
+        qualifiers = [self.qualifier[k] for k in columns if k != 'rowkey' and k != 'timestamp']
 
         # full table scan
         if not rowkey:
-            for rk, response in self.table.scan(columns=qualifiers, filter=filter_str):
-                yield self.unwrap(rk, response)
+            for rk, response in self.table.scan(columns=qualifiers, filter=filter_str,
+                                                include_timestamp=self.include_timestamp, timestamp=ts_max):
+                yield self.wrap(rk, response)
 
         # single rowkey
         elif isinstance(rowkey, basestring):
-            yield self.unwrap(rowkey, self.table.row(rowkey, qualifiers))
+            yield self.wrap(rowkey, self.table.row(rowkey, qualifiers, include_timestamp=self.include_timestamp,
+                                                   timestamp=ts_max))
 
         # multiple rowkey
         elif isinstance(rowkey, list):
-            for rk, response in self.table.rows(rowkey, qualifiers):
-                yield self.unwrap(rk, response)
+            for rk, response in self.table.rows(rowkey, qualifiers, include_timestamp=self.include_timestamp,
+                                                timestamp=ts_max):
+                yield self.wrap(rk, response)
 
         # range rowkey
         elif isinstance(rowkey, dict):
             for rk, response in self.table.scan(rowkey.get('since'), rowkey.get('until'), columns=qualifiers,
-                                                filter=filter_str):
-                yield self.unwrap(rk, response)
+                                                filter=filter_str, include_timestamp=self.include_timestamp,
+                                                timestamp=ts_max):
+                yield self.wrap(rk, response)
         else:
-            raise ValueError('Invalid rowkey')
+            raise ValueError('[HB-FDW] Invalid rowkey')
 
     def update(self, rowkey, newvalues):
-        if not rowkey: raise ValueError('rowkey should be specified!')
-        self.table.put(rowkey, self.wrap(newvalues))
+        if not rowkey: raise ValueError('[HB-FDW] rowkey should be specified! ')
+        if self.debug:
+            log('[HB-FDW] Update Begin: %s ================================' % rowkey)
+            log(newvalues)
+
+        payload = {self.qualifier.get(col_name): str(value)
+                   for col_name, value in newvalues.iteritems() if
+                   col_name != 'rowkey' and col_name != 'timestamp'}
+
+        # Given new rowkey in update statement will make a new copy with new rowkey
+        rowkey = newvalues.get('rowkey') or rowkey
+        self.table.put(rowkey, payload)
 
     def insert(self, values):
+        if self.debug:
+            log('[HB-FDW] Insert Begin: ================================')
+            log(values)
+
         rowkey = values.get('rowkey')
-        if not rowkey: raise ValueError('rowkey should be specified!')
+        if not rowkey:
+            raise ValueError('[HB-FDW] rowkey should be specified!')
+        timestamp = values.get('timestamp')
+        if timestamp and self.ts_converter:
+            timestamp = self.ts_converter(timestamp)
+
+        payload = {self.qualifier.get(col_name): str(value)
+                   for col_name, value in values.iteritems() if
+                   col_name != 'rowkey' and col_name != 'timestamp'}
+
         self.table.delete(rowkey)
-        self.table.put(rowkey, self.wrap(values))
+        self.table.put(rowkey, payload, timestamp=timestamp)
 
     def delete(self, rowkey):
-        if not rowkey: raise ValueError('rowkey should be specified!')
+        if not rowkey: raise ValueError('[HB-FDW] rowkey should be specified!')
+        if self.debug:
+            log("[HB-FDW] Delete Begin: %s ================================" % rowkey)
         self.table.delete(rowkey)
