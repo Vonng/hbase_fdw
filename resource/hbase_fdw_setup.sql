@@ -35,15 +35,12 @@ SELECT * FROM hbtest WHERE rowkey IN (
 SELECT rowkey,active,install,launch FROM hbtest
 WHERE rowkey BETWEEN '9c9a' AND '9c9c' AND active > 0 and install > 0 and rowkey ~ '^.{4}_.{10}_\w{24}' LIMIT 20;
 
-
-
+-- Test CRUD
 SELECT * FROM hbtest where rowkey in ('hbtest1','hbtest2');
-
 INSERT INTO hbtest (rowkey, active, install, launch) VALUES ('hbtest1', 1, 2, 3);
 INSERT INTO hbtest (rowkey, active, install, launch) VALUES ('hbtest2', 1, 2, 3);
-
 SELECT * FROM hbtest where rowkey in ('hbtest1','hbtest2');
-
 DELETE FROM hbtest where rowkey = 'hbtest1';
-
+UPDATE hbtest set active = 999 where rowkey = 'hbtest2';
 SELECT * FROM hbtest where rowkey in ('hbtest1','hbtest2');
+DELETE FROM hbtest where rowkey = 'hbtest2';

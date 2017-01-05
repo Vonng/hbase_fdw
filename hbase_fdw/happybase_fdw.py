@@ -190,11 +190,16 @@ class HappyBaseFdw(ForeignDataWrapper):
         else:
             raise ValueError('Invalid rowkey')
 
+    def update(self, rowkey, newvalues):
+        if not rowkey: raise ValueError('rowkey should be specified!')
+        self.table.put(rowkey, self.wrap(newvalues))
+
     def insert(self, values):
         rowkey = values.get('rowkey')
-        if not rowkey: return {}
-
+        if not rowkey: raise ValueError('rowkey should be specified!')
+        self.table.delete(rowkey)
         self.table.put(rowkey, self.wrap(values))
 
     def delete(self, rowkey):
+        if not rowkey: raise ValueError('rowkey should be specified!')
         self.table.delete(rowkey)
