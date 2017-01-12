@@ -1,1 +1,0 @@
-psql elysium < hbase_fdw_setup.sql
