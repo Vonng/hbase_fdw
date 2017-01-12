@@ -1,15 +1,19 @@
 # HBase FDW
 
 ### Introduction
-HBase FDW is a postgres foregin data wrapper based on multicorn in order to manipulate hbase from postgres.
+HBase FDW is a [PostgreSQL](https://www.postgresql.org/) FDW ([foregin data wrapper](https://wiki.postgresql.org/wiki/Foreign_data_wrappers) ) based on [Multicorn](http://multicorn.org/) in order to manipulate [HBase](http://hbase.apache.org/) from PostgreSQL.
 
 ## Structure
 * hbase_fdw:    Source code folder, Should put it into your python library path
-* resource:     Test files
+  * [happybase_fdw.py](hbase_fdw/happybase_fdw.py)  hbase_fdw based on happy base 
+* resource:     sql files
+  * [happybase_fdw_test.sql](resource/happybase_fdw_test.sql) Setup and test script for happybase_fdw
 
 ## Shortcut
 Before execute `make`, change `$TARGET_DIR` to your python lib path.
+
 e.g :`/usr/local/anaconda/lib/python2.7/site-packages`
+
 ```bash
 	sudo make link		soft link hbase_fdw into your $TARGET_DIR. Convient for debugging.
 	sudo make install 	copy hbase_fdw to your $TARGET_DIR.
@@ -45,7 +49,7 @@ OPTIONS (host '10.101.171.99',port '9090', table 'appuserstat', debug 'False', f
 There are some constraint about HBase foreign table DDL:
 * `rowkey` and `timestamp` is special in DDL.
 * `rowkey` is required, and it's type must be one of `BYTEA` or `TEXT`.
-* `timestamp` is optional. and it could be typed as BIGINT(raw hbase timestamp), DATE, TIMESTAMP, TIMESTAMPTZ.
+* `timestamp` is optional. and it could be typed as BIGINT(raw hbase timestamp), `DATE`, `TIMESTAMP`, `TIMESTAMPTZ`.
 * other columns will be normal hbase columns. And cf:qual will be formed according to following rules:
     * if column option `qualifier` and table option `family` is specified: `family_option+qualifier_option`
     * if only column option `qualifier` is specified: `qualifier_option`
@@ -61,9 +65,22 @@ CREATE FOREIGN TABLE IF NOT EXISTS hbtest (
   stat_1_day_install_count BYTEA,
   stat_1_day_launch_count  BYTEA
 ) SERVER hserver
-OPTIONS (host '10.101.171.99',port '9090', table 'appuserstat', debug 'False', family 'stat');
+OPTIONS (host '10.101.171.99',port '9090', table 'appuserstat');
 ```
-actually this is more like hbase's data model: really rough.
+This is more like hbase's data model: really rough. And corresponding SQL would be like:
+
+```sql
+SELECT
+  convert_from(rowkey,'UTF8') as rowkey,
+  timestamp,
+  convert_from(stat_1_day_active_count,'UTF8')::INTEGER as active,
+  convert_from(stat_1_day_install_count,'UTF8')::INTEGER as install,
+  convert_from(stat_1_day_launch_count,'UTF8')::INTEGER as launch
+FROM hbtest2
+WHERE rowkey = '9c9e_2016-02-02_56444370e7e12af0561e221c' ;
+```
+
+
 
 #### Query:
 
@@ -159,16 +176,12 @@ SELECT rowkey,active,install,launch FROM hbtest where rowkey in ('hbtest1','hbte
 
 
 
-
-
 ```sql
 DELETE FROM hbtest where rowkey = 'hbtest1';
 ```
 ```
 DELETE 1
 ```
-
-
 
 
 
@@ -182,8 +195,6 @@ UPDATE 1
 
 
 
-
-
 ```sql
 SELECT rowkey,active,install,launch FROM hbtest where rowkey in ('hbtest1','hbtest2', 'hbtest3');
 ```
@@ -193,8 +204,6 @@ SELECT rowkey,active,install,launch FROM hbtest where rowkey in ('hbtest1','hbte
  hbtest2 |    999 |       2 |      3
 (1 row)
  ```
-
-
 
 
 
